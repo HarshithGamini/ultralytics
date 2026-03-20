@@ -39,6 +39,7 @@ from ultralytics.nn.modules import (
     C3x,
     CBFuse,
     CBLinear,
+    CDAM,
     Classify,
     Concat,
     Conv,
@@ -1664,6 +1665,10 @@ def parse_model(d, ch, verbose=True):
                     args.extend((True, 1.2))
             if m is C2fCIB:
                 legacy = False
+        elif m is CDAM:
+            c1 = ch[f]
+            c2 = c1
+            args = [c1]
         elif m is AIFI:
             args = [ch[f], *args]
         elif m in frozenset({HGStem, HGBlock}):

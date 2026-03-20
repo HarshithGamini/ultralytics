@@ -52,6 +52,7 @@ __all__ = (
     "ResNetLayer",
     "SCDown",
     "TorchVision",
+    "CDAM",
 )
 
 
@@ -2065,3 +2066,77 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
+
+
+class CDAM(nn.Module):
+    """
+    Concurrent Dual Attention Module (CDAM)
+    Adapted for YOLO architectures.
+
+    Combines:
+    - Multi-branch feature attention (CMFA-style)
+    - Channel attention
+    - Spatial attention
+    """
+
+    def __init__(self, c1):
+        super().__init__()
+
+        # ----- Multi-feature attention branches -----
+        self.branch1 = nn.Sequential(
+            Conv(c1, c1, 1),
+        )
+
+        self.branch2 = nn.Sequential(
+            Conv(c1, c1, 1),
+        )
+
+        self.branch3 = nn.Sequential(
+            Conv(c1, c1, 1),
+        )
+
+        self.branch4 = nn.Sequential(
+            Conv(c1, c1, 1),
+        )
+
+        # ----- Channel Attention (SEM part) -----
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+
+        self.fc = nn.Sequential(
+            nn.Conv2d(c1, c1 // 4, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c1 // 4, c1, 1, bias=False),
+            nn.Sigmoid(),
+        )
+
+        # ----- Spatial Attention -----
+        self.spatial = nn.Sequential(
+            nn.Conv2d(c1, c1, 3, padding=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c1, 1, 1, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+
+        # ----- CMFA -----
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
+        b4 = self.branch4(x)
+
+        cmfa = b1 + b2 + b3 + b4 + x
+
+        # ----- Channel attention -----
+        ch = self.avgpool(x)
+        ch = self.fc(ch)
+        ch_out = x * ch
+
+        # ----- Spatial attention -----
+        sp = self.spatial(x)
+        sp_out = x * sp
+
+        sem = x + ch_out + sp_out
+
+        # ----- Final fusion -----
+        return cmfa + sem
