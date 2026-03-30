@@ -53,6 +53,10 @@ __all__ = (
     "SCDown",
     "TorchVision",
     "CDAM",
+    "NormL",
+    "SpatialGate",
+    "MPSA",
+    "MDA",
 )
 
 
@@ -2140,3 +2144,142 @@ class CDAM(nn.Module):
 
         # ----- Final fusion -----
         return cmfa + sem
+
+
+class NormL(nn.Module):
+    """Learnable per-channel layer norm. Equivalent to Keras NormL custom layer."""
+    def __init__(self, num_channels: int):
+        super().__init__()
+        self.a   = nn.Parameter(torch.ones(1, num_channels, 1, 1))
+        self.b   = nn.Parameter(torch.zeros(1, num_channels, 1, 1))
+        self.eps = 1e-6
+ 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mu    = x.mean(dim=1, keepdim=True)
+        sigma = x.std(dim=1, keepdim=True)
+        return self.a * (x - mu) / (sigma + self.eps) + self.b
+    
+    
+class SpatialGate(nn.Module):
+    """
+    Produces a (B, 1, H, W) attention gate from a feature map.
+    Replaces the external att_map input from the original pan_network code.
+    """
+    def __init__(self, in_ch: int):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Conv2d(in_ch, in_ch // 4, kernel_size=3, padding=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_ch // 4, 1, kernel_size=1, bias=False),
+            nn.Sigmoid(),
+        )
+ 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.gate(x)   # (B, 1, H, W)
+    
+
+class MPSA(nn.Module):
+    """
+    Cross-scale attention. Takes two feature maps:
+        v_feat  : deeper,  lower-res  e.g. (B, 512, 28, 28)  — from Stage 3
+        qk_feat : shallower, higher-res e.g. (B, 256, 56, 56) — from Stage 2
+ 
+    YAML usage:
+        - [[4, 2], 1, MPSA, [out_ch, v_ch, qk_ch]]
+        # spatial sizes are inferred from the tensors at runtime
+ 
+    Args:
+        out_ch : output channels
+        v_ch   : channels of the deeper (v) feature map
+        qk_ch  : channels of the shallower (q/k) feature map
+    """
+    def __init__(self, out_ch: int, v_ch: int, qk_ch: int):
+        super().__init__()
+        self.out_ch  = out_ch
+ 
+        self.v_proj  = nn.Conv2d(v_ch,  out_ch, 1, bias=False) if v_ch != out_ch else nn.Identity()
+        self.gate    = SpatialGate(v_ch)
+ 
+        self.norm    = NormL(out_ch)
+        self.refine  = nn.Sequential(
+            nn.Conv2d(out_ch, 32,     kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32,     out_ch, kernel_size=1, bias=False),
+        )
+        self.act     = nn.ReLU(inplace=True)
+ 
+    def forward(self, inputs):
+        v_feat, qk_feat = inputs          # list from YAML `from: [4, 2]`
+        B, _, v_h, v_w = v_feat.shape
+ 
+        # project v
+        v = self.v_proj(v_feat)           # (B, out_ch, v_h, v_w)
+ 
+        # learned spatial gate — generated at v resolution, upsampled for q/k
+        att_map_v  = self.gate(v_feat)    # (B, 1, v_h, v_w)
+        att_map_qk = F.interpolate(att_map_v, size=qk_feat.shape[2:],
+                                   mode="bilinear", align_corners=False)
+ 
+        # gate added to q/k then pooled down to v resolution
+        qk      = qk_feat + att_map_qk
+        qk_pool = F.adaptive_avg_pool2d(qk, (v_h, v_w))   # (B, qk_ch, v_h, v_w)
+ 
+        # flatten spatial for bmm
+        n       = v_h * v_w
+        v_flat  = v.flatten(2).permute(0, 2, 1)            # (B, n, out_ch)
+        qk_flat = qk_pool.flatten(2).permute(0, 2, 1)      # (B, n, qk_ch)
+ 
+        # attention in spatial domain  (n × n)
+        scale   = qk_flat.shape[-1] ** -0.5
+        att     = torch.bmm(qk_flat, qk_flat.transpose(1, 2)) * scale  # (B, n, n)
+        att     = att.softmax(dim=-1)
+ 
+        out     = torch.bmm(att, v_flat)                    # (B, n, out_ch)
+        out     = out.permute(0, 2, 1).reshape(B, self.out_ch, v_h, v_w)
+ 
+        # residual → relu → norm → lightweight refine
+        out     = self.act(out + v)
+        out     = self.norm(out)
+        out     = self.refine(out) + out
+ 
+        return out     # (B, out_ch, v_h, v_w)
+    
+    
+class MDA(nn.Module):
+    """
+    Channel self-attention. Single input; v = q = k = x.
+ 
+    YAML usage:
+        - [-1, 1, MDA, [ch]]
+        # ch must match the channel count of the preceding layer
+ 
+    Args:
+        ch : number of channels
+    """
+    def __init__(self, ch: int):
+        super().__init__()
+        self.scale  = ch ** -0.5
+        self.q_proj = nn.Conv2d(ch, ch, 1, bias=False)
+        self.k_proj = nn.Conv2d(ch, ch, 1, bias=False)
+        self.v_proj = nn.Conv2d(ch, ch, 1, bias=False)
+        self.norm   = NormL(ch)
+        self.act    = nn.ReLU(inplace=True)
+ 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+ 
+        q = self.q_proj(x).flatten(2).permute(0, 2, 1)   # (B, n, C)
+        k = self.k_proj(x).flatten(2).permute(0, 2, 1)
+        v = self.v_proj(x).flatten(2).permute(0, 2, 1)
+ 
+        # channel-space attention  (C × C)
+        att = torch.bmm(q.transpose(1, 2), k) * self.scale   # (B, C, C)
+        att = att.softmax(dim=-1)
+ 
+        out = torch.bmm(v, att)                               # (B, n, C)
+        out = out.permute(0, 2, 1).reshape(B, C, H, W)
+ 
+        out = self.act(out + x)
+        out = self.norm(out)
+        return out     # (B, ch, H, W)
+    

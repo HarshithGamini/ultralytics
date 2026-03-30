@@ -73,6 +73,8 @@ from ultralytics.nn.modules import (
     YOLOESegment,
     YOLOESegment26,
     v10Detect,
+    MPSA,
+    MDA,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, WINDOWS, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1669,6 +1671,17 @@ def parse_model(d, ch, verbose=True):
             c1 = ch[f]
             c2 = c1
             args = [c1]
+        elif m is MPSA:
+            # args from yaml: [out_ch, v_ch, qk_ch]
+            # width-scale the three channel args
+            args[0] = make_divisible(args[0] * width, 8)  # out_ch
+            args[1] = make_divisible(args[1] * width, 8)  # v_ch
+            args[2] = make_divisible(args[2] * width, 8)  # qk_ch
+            c2 = args[0]                                   # output ch for next layer
+        elif m is MDA:
+            # args from yaml: [ch]
+            args[0] = make_divisible(args[0] * width, 8)  # ch
+            c2 = args[0]
         elif m is AIFI:
             args = [ch[f], *args]
         elif m in frozenset({HGStem, HGBlock}):

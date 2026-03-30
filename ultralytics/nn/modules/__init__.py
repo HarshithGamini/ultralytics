@@ -60,6 +60,10 @@ from .block import (
     SCDown,
     TorchVision,
     CDAM,
+    NormL,
+    SpatialGate,
+    MPSA,
+    MDA,
 )
 from .conv import (
     CBAM,
