@@ -25,6 +25,7 @@ __all__ = (
     "SPP",
     "SPPELAN",
     "SPPF",
+    "DPSA_SPPF"
     "AConv",
     "ADown",
     "Attention",
@@ -2071,3 +2072,63 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
+
+
+class DPSA_SPPF(nn.Module):
+    def __init__(self, c1, c2, k=5):
+        super().__init__()
+
+        c_ = c1 // 2
+
+        self.cv1 = nn.Conv2d(c1, c_, 1, 1)
+        self.cv2 = nn.Conv2d(c_ * 4, c2, 1, 1)
+
+        self.m5 = nn.MaxPool2d(5, 1, 2)
+        self.m9 = nn.MaxPool2d(9, 1, 4)
+        self.m13 = nn.MaxPool2d(13, 1, 6)
+
+        # Channel attention
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.mlp = nn.Sequential(
+            nn.Conv2d(c2, c2 // 4, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c2 // 4, c2, 1, bias=False)
+        )
+
+        self.sigmoid = nn.Sigmoid()
+
+        # Spatial attention
+        self.spatial = nn.Sequential(
+            nn.Conv2d(2, 1, 7, padding=3, bias=False),
+            nn.Sigmoid()
+        )
+
+        self.cv3 = nn.Conv2d(c2, c2, 1, 1)
+
+    def forward(self, x):
+        x = self.cv1(x)
+
+        y1 = self.m5(x)
+        y2 = self.m9(x)
+        y3 = self.m13(x)
+
+        y = torch.cat([x, y1, y2, y3], dim=1)
+        y = self.cv2(y)
+
+        avg_out = self.mlp(self.avg_pool(y))
+        max_out = self.mlp(self.max_pool(y))
+        w = self.sigmoid(avg_out + max_out)
+        y = y * w
+
+        avg_out = torch.mean(y, dim=1, keepdim=True)
+        max_out, _ = torch.max(y, dim=1, keepdim=True)
+        s = torch.cat([avg_out, max_out], dim=1)
+        s = self.spatial(s)
+
+        y = y * s
+        y = self.cv3(y)
+
+        return y
+    
